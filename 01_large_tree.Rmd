@@ -1,0 +1,375 @@
+---
+title: "Hydrolase Tree"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(seqinr)
+```
+
+
+## Sequences
+
+To track the evolutionary history of NN-Hydrolases in corals we started with the sequence `Cluster012104` which has been cloned from coral tissue. 
+
+```bash
+>1.2.16853.m1_Cluster012104
+MKILIVVQLLFCVFPATNACSEIRVTAEDKSVIVGRTSDLGKDMFSNVVVEPEGYSRVAVPAEGCSHHEPLLSWQNKYAVAYLDAWDQFLSADGMNSAGLSVSSLMFSPFTKYQDVPPDKCGQAVSQLEFGLWLLGTFSTVQEVRKSMEEEWFPLVFPRTFQGYLFEEHFSVVDKTGDAIVIEYTEQGRKVYNNTLGVLTNSPNYEFQMLNIRNYIELSKYERDPLELGGHKFPRFGAGSGLLGMPGDFTPPSRFVRALFLKEFATQPKTSKEAVNLAFHVLNSVDIPVGVASVGKTEPDSDYTQWTVAKDLTNNALYFRDYNDMTIRVVYLDKVQQGQVLRMKAYGPITGFKDVTGELEPVYPNKEEL
+```
+
+
+BLASTP searches against the NCBI nr database were used to retrieve related sequences in three ways.
+
+1. Eukaryotic matches only
+2. Non Eukaryotic matches
+3. Matches regardless of taxa. 
+
+These searches were run allowing a maximum of 500 hits.  This maximum was reached whenever we allowed for non-eukaryotic matches (ie bacteria) but only 300 hits (only 184 with evalue<1e-10) were returned for Eukaryotic matches only. Checking the overlap of these searches revealed that the unrestricted search (option 3 above) returned 470 bacterial matches and only 30 Eukaryotic.  In order avoid swamping the results with bacteria we proceeded by combining results from the separate searches. 
+
+```bash
+blastp -remote -db nr -query ../Hydrolase_Sequences_OIST_JCU/Amino_acids/Cluster012104_hydrolase_cloned_aa.fasta -outfmt '6 std staxid ssciname' -max_hsps 1 -entrez_query 'Eukaryota [ORGN]' > blastp_results_euk.tsv
+
+blastp -remote -db nr -query ../Hydrolase_Sequences_OIST_JCU/Amino_acids/Cluster012104_hydrolase_cloned_aa.fasta -outfmt '6 std staxid ssciname' -max_hsps 1 -entrez_query 'NOT Eukaryota [ORGN]' > blastp_results_noneuk.tsv
+
+blastp -remote -db nr -query ../Hydrolase_Sequences_OIST_JCU/Amino_acids/Cluster012104_hydrolase_cloned_aa.fasta -outfmt '6 std staxid ssciname' -max_hsps 1 > blastp_results_both.tsv
+```
+
+```{r}
+blcols <- c("qaccver", "saccver", "pident", "length", "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "evalue", "bitscore", "staxid","ssciname")
+
+blast_res_ek <- read_tsv("hpc/hydrolase_tree/blastp_results_euk.tsv",col_names = blcols) %>% 
+  filter(evalue < 1e-10)
+blast_res_ne <- read_tsv("hpc/hydrolase_tree/blastp_results_noneuk.tsv",col_names = blcols) %>% 
+  filter(evalue < 1e-10)
+
+name2taxid <- rbind(blast_res_ek,blast_res_ne) %>% select(name=saccver,taxid=staxid)
+```
+
+
+```{r, eval=FALSE}
+# Here we use the rentrez package to fetch amino acid sequences for IDs returned by blast
+# These are saved to fasta files for later alignment and tree building
+library(rentrez)
+save_ids2fasta <- function(blast_ids,outpath){
+  nids <- length(blast_ids)
+
+  starts <- seq(1,to=nids-100,by=100) 
+  cat("", file=outpath, append=FALSE)
+  for( seq_start in starts){
+    recs <- entrez_fetch("protein",id=blast_ids[seq_start:(seq_start+99)], rettype = "fasta")
+    cat(recs, file=outpath, append=TRUE)
+  }
+  recs <- entrez_fetch("protein",id=blast_ids[(starts[length(starts)]+100):nrow(blast_res)], rettype = "fasta") # And this adds redundant sequences
+  cat(recs, file=outpath, append=TRUE)
+}
+
+save_ids2fasta(blast_res_ek$saccver,"hpc/hydrolase_tree/blastp_results_euk.fasta")
+save_ids2fasta(blast_res_ne$saccver,"hpc/hydrolase_tree/blastp_results_noneuk.fasta")
+```
+
+
+```{r, eval=FALSE}
+# Read separate fastas for euk and non-euk and combine them
+#
+seq2tsv <- function(sqobj){
+  seq <- sqobj %>% paste(collapse="")
+  seqnm <- attr(sqobj,"name")
+  sqanno <- attr(sqobj,"Annot")
+  data.frame(name=seqnm,anno=sqanno,aaseq=seq) %>% 
+    extract(anno,into="species",regex="\\[([^\\]]*)",remove = FALSE)
+}
+euk_fasta <- read.fasta("hpc/hydrolase_tree/blastp_results_euk.fasta")
+noneuk_fasta <- read.fasta("hpc/hydrolase_tree/blastp_results_noneuk.fasta")
+
+euk_data <- map_dfr(euk_fasta,seq2tsv)
+non_euk_data <- map_dfr(noneuk_fasta,seq2tsv)
+combined_data <- rbind(euk_data,non_euk_data) %>% 
+  distinct() %>% 
+  filter(!is.na(aaseq)) %>% 
+  filter(aaseq!="") 
+```
+
+
+```{r, eval=FALSE}
+write.fasta(as.list(combined_data$aaseq),combined_data$name, "hpc/hydrolase_tree/blastp_combined.fasta")
+```
+
+Next we combine sequences obtained via BLASTP with curated sequences from *A. digitifera*, *A. millepora*, *S. pistillata*, as well as Hydroids. Curated sequences are in the file `hpc/hydrolase_tree/known_seqs.fasta`.  
+
+```bash
+cat known_seqs.fasta blastp_combined.fasta > aa.fasta
+```
+
+Some duplicate sequences are present due to inclusion from multiple methods. We found these using cd-hit with
+
+```bash
+cd-hit -c 0.99 -G 1  -U 10 -i aa.fasta -o aa_clusters
+```
+
+Then report them with
+
+```bash
+cat aa_clusters.clstr | awk 'BEGIN{n=-1;cn=NULL;members=""}/Cluster/{print cn,n,members;cn=$0;n=0;members=""} !/Cluster/{n+=1;members = sprintf("%s;%s",members,$3)}' | sed 's/\.\.\.//g' | awk '$3>1{print $4}' | grep -v '*' | sed 's/>//g' > ident.txt
+```
+
+```{r, eval=FALSE}
+identical_seqs <- read_tsv("hpc/hydrolase_tree/ident.txt",col_names = c("ids")) %>% 
+  mutate(cluster = row_number()) %>% 
+  separate_longer_delim(ids,delim = ";") %>% 
+  filter(ids!="") %>% 
+  left_join(tree_data,by= c("ids"="name")) %>% 
+  filter(ids %in% retained_seqs)
+
+retained_identical <- identical_seqs %>% 
+  group_by(cluster) %>% 
+  slice_head(n=1) %>% pull(ids)
+
+identical_to_remove <- setdiff(identical_seqs$ids,retained_identical)
+
+final_retained_seqs <- setdiff(retained_seqs,identical_to_remove)
+write_lines(final_retained_seqs,"hpc/hydrolase_tree/retained_seqs.tsv")
+```
+
+
+# Alignment 
+
+Retained sequences were then aligned using highly sensitive settings with MAFFT. 
+
+Note that MAFFT settings were chosen based on the fact that we know little about these sequences which suggests the [genafpair](https://mafft.cbrc.jp/alignment/software/algorithms/algorithms.html#GLE) setting
+
+```bash
+cat retained_seqs.tsv | xargs -I{} samtools faidx aa.fasta {} > aa_retained.fasta
+
+mafft --maxiterate 1000 --genafpair aa_retained.fasta > aa_retained_align.fasta
+```
+
+Next we masked positions with more than 50% missing bases and export the alignment to a fasta file.
+
+```{r, eval=FALSE}
+library(DECIPHER)
+
+aafas <- readAAMultipleAlignment("hpc/hydrolase_tree/aa_retained_align.fasta")
+
+aafas <- readAAStringSet("hpc/hydrolase_tree/aa_retained_align.fasta")
+
+maafas <- MaskAlignment(aafas,showPlot = TRUE)
+
+AAStringSet(maafas) %>% writeXStringSet("hpc/hydrolase_tree/aa_retained_align_masked.fasta")
+```
+
+
+```{r, eval=FALSE}
+# Construct a table with species information for each sequence
+# We do this using the NCBI taxonomy database to allow lookup of taxonomy based on the sequence ID via the taxizedb package
+#
+aa_align <- read.fasta("hpc/hydrolase_tree/aa_retained_align_masked.fasta")
+
+aa_align_table <- data.frame(name=names(aa_align)) %>% 
+  left_join(combined_data) %>% 
+  left_join(name2taxid) %>% 
+  mutate(taxid = case_when(
+    grepl("^adi_",name) ~ 70779,
+    grepl("_Cluster",name) ~ 45264,
+    name=="s35_g10.t1_CGH" ~ 205096,
+    grepl("^KAJ",name) ~ 174260,
+    name %in% c("XP_057300278.1","XP_057297033.1","XP_057300296.1","XP_057289608.1","XP_057300279.1","XP_057297401.1") ~ 13093,
+    name %in% c("GCHV01019371.1") ~ 6096,
+    name == "GFGT01253758.1" ~ 544496,
+    name == "HAMU01062968.1" ~ 252671,
+    name == "IAAF01035253.1" ~ 308578,
+    name == "KAI1617170.1" ~ 2486360,
+    .default = taxid
+  )) %>% 
+  mutate(taxid = as.character(taxid)) %>% 
+  select(-anno,-aaseq)
+
+library(taxizedb)
+# Only needs to be done once. Downloads the NCBI taxonomy database
+#db_download_ncbi()
+
+classification2tsv <- function(cls){
+  cls %>% as.data.frame() %>% add_column(taxid = last(cls$id))
+}
+
+taxinfo_raw <- classification(unique(aa_align_table$taxid)) %>% 
+  map_dfr(classification2tsv)
+
+# Summarise Euks
+taxinfo <- taxinfo_raw %>% 
+  select(-id) %>% 
+  filter(rank %in% c("superkingdom","kingdom","phylum","class","family", "species")) %>% 
+  pivot_wider(names_from = rank, values_from = name) %>% 
+  mutate(high = ifelse(is.na(kingdom),superkingdom,kingdom)) %>% 
+  mutate(medium = case_when(
+    is.na(phylum) ~ class,
+    TRUE ~ phylum
+  )) %>% 
+  mutate(higher = case_when(
+    high %in% c("Fungi","Viridiplantae","Eukaryota") ~ "Other",
+    TRUE ~ high
+  ))
+
+tree_data <- aa_align_table %>% 
+  select(-species) %>% 
+  left_join(taxinfo) %>% 
+  mutate(display_name = case_when(
+    name=="adi_v1.104532.e" ~ "Acropora digitifera : 104532.e",
+    name=="adi_v1.21639.e" ~ "Acropora digitifera : 21639.e",
+    name=="adi_v1.03137.e" ~ "Acropora digitifera : 03137.e",    
+    name=="adi_v1.03136.e" ~ "Acropora digitifera : 03136.e",
+    name=="1.2.13416.m1_Cluster013632" ~ "Acropora millepora : 1.2.13416.m1",
+    name=="1.2.13415.m1_Cluster017402" ~ "Acropora millepora : 1.2.13415.m1", 
+    name=="1.2.7139.m1_Cluster014186" ~ "Acropora millepora : 1.2.7139.m1",    
+    name=="s35_g10.t1_CGH" ~ "Lobophytum pauciflorum : s35_g10.t1",    
+    TRUE ~ species
+  ))
+write_rds(tree_data,"cache/tree_data.rds")
+```
+
+
+Run IQ-Tree on the masked alignment
+
+```bash
+iqtree -s aa_retained_align_masked.fasta -m TEST -bb 1000 -nt 2
+```
+
+
+```{r}
+library(ggtree)
+library(ape)
+library(phytools)
+library(treeio)
+
+aa_tree <- read.iqtree("hpc/hydrolase_tree/aa_retained_align_masked.fasta.treefile")
+aa_tree_rh <- midpoint.root(aa_tree@phylo)
+```
+
+```{r}
+# Detailed tree
+tree_data <- read_rds("cache/tree_data.rds") %>% 
+  filter(name %in% aa_tree_rh$tip.label) %>% 
+  mutate(special = case_when(
+    name=="XP_029207486.1" ~ "AmNtNH1",
+    .default = NA
+  ))
+```
+
+
+```{r}
+gp_detailed <- ggtree(aa_tree_rh) %<+% tree_data +
+  geom_tippoint(aes(color=high)) +
+  geom_tiplab(aes(label=species),align = T,size=1) + 
+  xlim(NA,5) +
+  geom_text(aes(label=node), hjust=1.3,vjust=-1.0,size=1) +
+  theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+
+```{r, eval=FALSE}
+ggsave(gp_detailed,file="figures/hydrolase_tree_aa_detailed_2.pdf",height = 30,width = 10)
+```
+
+
+```{r}
+anthozoans <- tree_data %>% filter(class=="Anthozoa") %>% pull(name)
+anthozoans_ancestor <- getMRCA(aa_tree_rh,anthozoans)
+
+oomycetes <- tree_data %>% filter(medium=="Oomycota") %>% pull(name)
+oomycetes_ancestor <- getMRCA(aa_tree_rh,oomycetes)
+
+plants <- tree_data %>% filter(high=="Viridiplantae") %>% pull(name)
+plants_ancestor <- getMRCA(aa_tree_rh,plants)
+
+tree_data_final <- tree_data %>% 
+  distinct() %>% 
+  mutate(display_name = case_when(
+    taxid==308578 ~ "Turritopsis sp.",
+    .default = display_name
+  ))
+```
+
+
+
+
+
+
+```{r}
+
+gpf <- ggtree(aa_tree_rh) %<+% tree_data_final +
+  geom_tippoint(aes(color=higher)) +
+  geom_tiplab(aes(label=display_name),align = T,size=2.5) + 
+  xlim(NA,5) +
+geom_label(aes(label=special),label.size = 0.1,size=2,nudge_x=0.3) +  
+#  geom_label2(aes(label=label, subset = !is.na(as.numeric(label)) ),label.size=0.1,label.padding = unit(0.1, "lines"),size=3)   
+  geom_label2(aes(label=label, subset = !is.na(as.numeric(label)) & as.numeric(label) < 100),label.size=0.1,label.padding = unit(0.1, "lines"),size=3) 
+
+gpf %>% 
+  scaleClade(714,0.1) %>% 
+  scaleClade(686,0.1) %>% 
+  scaleClade(682,0.1) %>%    
+  scaleClade(869,0.1) %>%   
+  scaleClade(855,0.1) %>% 
+  scaleClade(702,0.1) %>% 
+  scaleClade(636,0.1) %>%       
+  scaleClade(620,0.1) %>%     
+  scaleClade(oomycetes_ancestor,0.1) %>%   
+  scaleClade(504,0.1) %>%      
+  scaleClade(610,0.1) %>%        
+  scaleClade(587,0.1) %>%
+  scaleClade(594,0.1) %>% 
+  scaleClade(615,0.1) %>%
+  # scaleClade(1026,0.1) %>%    
+      
+  collapse(714,'max',fill="red") %>%
+  collapse(686,'max',fill="red") %>% 
+  collapse(682,'max',fill="brown") %>% 
+  collapse(869,'max',fill="red") %>% 
+  collapse(855,'max',fill="red") %>% 
+  collapse(702,'max',fill="red") %>% 
+  collapse(636,'max',fill="red") %>%   
+  collapse(620,'max',fill="red") %>% 
+  collapse(oomycetes_ancestor,'max', fill="lightgreen") %>%   
+  collapse(504,'max',fill="brown") %>%       
+  collapse(610,'max',fill="brown") %>%         
+  collapse(606,'max',fill="grey") %>% 
+  collapse(587,'max',fill="grey") %>% 
+  collapse(615,'max',fill="red") +
+  # collapse(1026,'max',fill="brown") +
+    
+  geom_cladelab(node=714,label="Bacteria",offset = 1.05, fontsize=3) +
+  geom_cladelab(node=686,label="Bacteria",offset = 0.7, fontsize=3)   +
+  geom_cladelab(node=682,label="SAR",offset = 0.1,fontsize=3) +
+  geom_cladelab(node=869,label="Bacteria",offset = 0.9, fontsize=3)    +
+  geom_cladelab(node=855,label="Bacteria",offset = 0.8, fontsize=3)    +  
+  geom_cladelab(node=702,label="Bacteria",offset = 0.6,fontsize = 3) +
+  geom_cladelab(node=636,label="Bacteria",offset = 1.3, fontsize=3)   +      
+  geom_cladelab(node=620,label="Bacteria",offset = 1, fontsize=3)   +  
+  geom_cladelab(node=oomycetes_ancestor,label="Oomycota",offset = 0.9, fontsize=3)   +     
+  geom_cladelab(node=504,label="SAR",offset = 1.5, fontsize=3)   +    
+  geom_cladelab(node=610,label="SAR",offset = .15, fontsize=3)   +      
+  geom_cladelab(node=587,label="Plants, Fungi, Protists",offset = 1.5,fontsize=3)   +
+  geom_cladelab(node=606,label="Plants",offset = 1.5,fontsize=3)   +  
+  geom_cladelab(node=615,label="Bacteria",offset = 0.75, fontsize=3)   + 
+  
+  geom_hilight(node=473,color="black") +
+  geom_cladelab(node=473, label = "Scleractinia",offset = 2.05) +
+  
+  geom_hilight(node=482,color="black") +
+  geom_cladelab(node=482,label = "Hydrozoa",offset = 1.1) + theme(legend.position = "none")
+
+# geom_cladelab(node=1026,label="SAR",offset = 1.7,fontsize=3) 
+ggsave("figures/hydrolase_tree_aa_final2.pdf",height=12,width=8)
+```
+
+Figure X: Maximum likelihood tree for NN-Hydrolases in corals and outgroup taxa.  Tree includes all sequences obtained as BLASTP hits to the nr database for Eukaryotes only (189 sequences) and Bacteria (401 sequences).  Large outgroup clades are collapsed and scaled to 10% of their original size.  All nodes have >95% branch support unless otherwise shown (ie node labels show less supported clades). 
+
+
+```{r, eval=FALSE}
+viewClade(gp,644)
+
+ggsave(gp_subset, file="figures/hydrolase_tree_aa_subset.pdf")
+```
+
+

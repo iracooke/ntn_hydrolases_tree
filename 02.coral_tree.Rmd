@@ -1,0 +1,175 @@
+---
+title: "Coral hydrolase tree"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+```
+
+To explore the evolutionary history of AmNtNH1 we extracted homologous sequences from the following species.  
+
+Species included: *Acropora millepora*, *Acropora digitifera*, *Orbicella faveolata*,  *Desmophyllum pertusum*, *Stylophora pistillata*, *Pocillopora damicornis*, *Hydra vulgaris*, *Hydractinia symbiolongicarpus*, *Acropora tenuis*, *Montipora capitata*.
+
+These species were chosen because they have available whole-genome sequences from which relatively complete gene sets could be derived, and because they capture major lineages with AmNtNH1 genes.
+
+Homologous sequences were retrieved from predicted protein sets using blastp with the cloned AmNtNH1 sequence as a query.
+
+```bash
+>1.2.16853.m1_Cluster012104
+MKILIVVQLLFCVFPATNACSEIRVTAEDKSVIVGRTSDLGKDMFSNVVVEPEGYSRVAVPAEGCSHHEPLLSWQNKYAVAYLDAWDQFLSADGMNSAGLSVSSLMFSPFTKYQDVPPDKCGQAVSQLEFGLWLLGTFSTVQEVRKSMEEEWFPLVFPRTFQGYLFEEHFSVVDKTGDAIVIEYTEQGRKVYNNTLGVLTNSPNYEFQMLNIRNYIELSKYERDPLELGGHKFPRFGAGSGLLGMPGDFTPPSRFVRALFLKEFATQPKTSKEAVNLAFHVLNSVDIPVGVASVGKTEPDSDYTQWTVAKDLTNNALYFRDYNDMTIRVVYLDKVQQGQVLRMKAYGPITGFKDVTGELEPVYPNKEEL
+```
+
+BLAST was run for each species as follows
+
+```bash
+blastp -db $species.faa -query Cluster012104_hydrolase_cloned_aa.fasta -outfmt '6 std staxid ssciname' -max_hsps 1 -evalue 0.00001 > ${species}_blastp_results.tsv
+```
+
+These blast results were then processed using scripts [02.find_loci.sh](hpc/hydrolase_tree_cnidarians/02.find_loci.sh) and [03.extract_seqs.sh](hpc/hydrolase_tree_cnidarians/03.extract_seqs.sh) to extract sequences.  
+
+```{r}
+gff_cols <- c('scaffold','source','feature','start','end','score','strand','phase','attributes')
+
+read_gff_refseq <- function(path){
+  read_tsv(path,col_names = gff_cols,show_col_types = F,col_types = "ccciicccc") %>% 
+   extract(attributes, into="ID", regex="ID=([^;]*)",remove = F) %>% 
+    extract(attributes, into="protein_id",regex="protein_id=([^;]*)",remove = F) %>% 
+    extract(attributes, into="gene",regex="gene=([^;]*)",remove = F) %>% 
+    extract(attributes, into="locus_tag",regex="locus_tag=([^;]*)",remove = F) %>% 
+    mutate(locus = case_when(
+    is.na(gene) & !is.na(locus_tag) ~ locus_tag,
+    .default = gene
+  ))
+}
+
+read_gff_oist <- function(path){
+  read_tsv(path,col_names = gff_cols,show_col_types = F,col_types = "ccciicccc") %>% 
+   extract(attributes, into="ID", regex="ID=([^;]*)",remove = F) %>% 
+    mutate(protein_id=ID) %>% 
+    mutate(gene=ID) %>% 
+    mutate(locus_tag=ID) %>% 
+  extract(ID,into="locus",regex = "([a-z]+_s[0-9]+.g[0-9]+).t[0-9]+")
+}
+
+read_gtf_oist <- function(path){
+  read_tsv(path,col_names = gff_cols,show_col_types = F,col_types = "ccciicccc") %>% 
+   extract(attributes, into="ID", regex="transcript_id \"([^\"]*)",remove = F) %>% 
+    mutate(protein_id=ID) %>% 
+    mutate(gene=ID) %>% 
+    mutate(locus_tag=ID) %>% 
+  extract(ID,into="locus",regex = "(mcac_s[0-9]+.g[0-9]+).t[0-9]+")
+}
+
+read_gff <- function(path){
+  species <- basename(path) %>% str_extract("[^\\.]*")
+  ds <- NULL
+  if (species %in% c("adig","aten")){
+    ds <- read_gff_oist(path)
+  } else if (species %in% c("mcac")) {
+    ds <- read_gtf_oist(path)
+  } else {
+    ds <- read_gff_refseq(path)
+  }
+  ds %>% add_column(species_id=species)
+}
+```
+
+
+```{r}
+prot_lengths <- read_tsv("hpc/hydrolase_tree_cnidarians/prot_lengths.tsv",col_names = c("protein_id","aa_length"))
+cds_lengths <- read_tsv("hpc/hydrolase_tree_cnidarians/cds_lengths.tsv",col_names = c("cds_id","na_length")) %>% 
+  extract(cds_id,into = "protein_id",regex = "cds_([^\\.]*.[0-9])",remove = F) %>% 
+  mutate(protein_id = case_when(
+    is.na(protein_id) ~ cds_id,
+    .default = protein_id
+  ))
+```
+
+
+```{r}
+gff_data <- list.files("hpc/hydrolase_tree_cnidarians/",pattern = ".gff",full.names = T) %>% 
+  map_dfr(read_gff)  %>% 
+  left_join(prot_lengths) %>%
+  left_join(cds_lengths) %>% 
+  group_by(locus) %>% 
+  slice_max(order_by = na_length,with_ties = F)
+```
+
+```{r, eval=FALSE}
+gff_data %>% 
+  select(species_id,protein_id,cds_id) %>% 
+  write_csv("hpc/hydrolase_tree_cnidarians/cds_2_prot.csv")
+```
+
+We then aligned these sequences using MAFFT as follows
+
+```bash
+mafft --maxiterate 1000 --genafpair hydrolases.faa > hydrolases_aligned.faa
+```
+
+Cleaned alignments to remove positions with less than 50% alignable sequences
+
+```bash
+cat hydrolases_aligned.faa | goalign clean sites -c 0.5 --char '-' > hydrolases_aligned_cleaned.faa
+```
+
+Built a tree using IQ-Tree
+
+```bash
+iqtree -s hydrolases_aligned_cleaned.faa -m TEST -bb 1000 -alrt 1000 -nt 2
+```
+
+
+```{r}
+library(ggtree)
+library(ape)
+library(phytools)
+library(treeio)
+
+cnido_tree <- read.iqtree("hpc/hydrolase_tree_cnidarians/hydrolases_aligned_cleaned.faa.treefile")
+
+cnido_tree_mpr <- midpoint.root(cnido_tree@phylo)
+```
+
+```{r}
+species_info <- read_csv("hpc/hydrolase_tree_cnidarians/species.csv") %>% 
+  full_join(read_csv("hpc/hydrolase_tree_cnidarians/species2.csv"))
+
+cnido_tree_data <- gff_data %>% 
+  full_join(read_csv("hpc/hydrolase_tree_cnidarians/mcap_extra.csv")) %>% 
+  ungroup() %>% 
+  select(protein_id,species=species_id) %>% 
+  left_join(species_info) %>% 
+  mutate(full_label = paste(binomial,protein_id,sep = ";")) %>% 
+  mutate(clade = case_when(
+    clade=="complex" ~ "Complexa",
+    clade=="robust" ~ "Robusta",
+    clade=="hydrozoan" ~ "Hydrozoa"
+  )) %>% 
+  mutate(special = case_when(
+    protein_id=="XP_029207486.1" ~ "AmNtNH1",
+    .default = NA
+  ))
+```
+
+
+```{r}
+ggtree(cnido_tree_mpr) %<+% cnido_tree_data +
+  geom_tippoint(aes(color=clade)) +
+  geom_tiplab(aes(label=full_label),align = T,size=2,offset = 0.5) +
+#  geom_label2(aes(label=SH_aLRT,subset = !is.na(as.numeric(SH_aLRT))),label.size=0.1,label.padding = unit(0.05, "lines"),size=2,nudge_x = -0.07,nudge_y = 0.05) + 
+  geom_nodelab(aes(label=label),label.size=0.1,label.padding = unit(0.05, "lines"),size=2,nudge_x = -0.15,nudge_y = 0.35) +
+  geom_label(aes(label=special),label.size = 0.1,size=2,nudge_x=0.3) +
+  theme(legend.position = "bottom",legend.title = element_blank()) +
+  xlim(NA,4) 
+#  geom_label2(aes(label=label, subset = !is.na(as.numeric(label)) & as.numeric(label) < 100),label.size=0.1,label.padding = unit(0.1, "lines"),size=3)
+```
+
+
+```{r, eval=FALSE}
+ggsave(filename = "figures/coraltree.png",width = 8,height = 6)
+ggsave(filename = "figures/coraltree.pdf",width = 6,height = 6)
+```
+
